@@ -359,6 +359,42 @@ if "--cuda_ext" in sys.argv:
                           extra_compile_args={'cxx': ['-O3'] + version_dependent_macros,
                                               'nvcc':nvcc_args_transformer if not IS_ROCM_PYTORCH else hipcc_args_transformer}))
 
+#***********  fused_weight_gradient_mlp_cuda   ****************
+    '''
+    if not IS_ROCM_PYTORCH:
+        _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
+    else:
+        _, bare_metal_version, bare_metal_minor  = get_rocm_bare_metal_version(ROCM_HOME)
+    print ("INFO: 1111-Building the fused_weight_gradient_mlp_cuda apply extension.", int(bare_metal_version))
+    if int(bare_metal_version) >= 6:
+        print ("INFO: 2222-Building the fused_weight_gradient_mlp_cuda apply extension.", int(bare_metal_version))
+        cc_flag = []
+        cc_flag.append("-gencode")
+        cc_flag.append("arch=compute_70,code=sm_70")
+        cc_flag.append("-gencode")
+        cc_flag.append("arch=compute_80,code=sm_80")
+        if int(bare_metal_version) >= 6.1:
+            cc_flag.append("-gencode")
+            cc_flag.append("arch=compute_86,code=sm_86")
+        if int(bare_metal_version) >= 6.2:
+            cc_flag.append("-gencode")
+            cc_flag.append("arch=compute_90,code=sm_90")
+        '''
+    ext_modules.append(
+        CUDAExtension(
+            name="fused_weight_gradient_mlp_cuda",
+            include_dirs=[os.path.join(this_dir, "csrc")],
+            sources=[
+                "csrc/megatron/fused_weight_gradient_dense.cpp",
+                "csrc/megatron/fused_weight_gradient_dense_cuda.cu",
+                "csrc/megatron/fused_weight_gradient_dense_16bit_prec_cuda.cu",
+            ],
+            extra_compile_args={
+                "cxx": ["-O3"] + version_dependent_macros,
+                "nvcc":nvcc_args_transformer if not IS_ROCM_PYTORCH else hipcc_args_transformer,
+                }
+        )
+    )
 
 if "--bnp" in sys.argv or "--cuda_ext" in sys.argv:
     if "--bnp" in sys.argv:
