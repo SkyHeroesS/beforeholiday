@@ -4,7 +4,7 @@ docker run -it --network=host -v /home/yigex/huggingface/heyi:/workspace  --devi
 
 mkdir heyi && cd heyi
 
-git clone https://github.com/eliotwang/apex
+git clone -b heyi_fused_grad_accumulation https://github.com/eliotwang/apex
 
 cd apex
 
