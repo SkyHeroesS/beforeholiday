@@ -10,6 +10,4 @@ cd apex
 
 python setup.py install --cpp_ext --cuda_ext
 
-cd tests
-
-bash run.sh
+python tests/L0/run_transformer/test_weight_grad.py

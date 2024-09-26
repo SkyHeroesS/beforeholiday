@@ -13,6 +13,7 @@
 #include "type_shim.h"
 
 /* Includes, HIP */
+#include <hipblaslt/hipblaslt.h>
 #include <hipblaslt/hipblaslt-ext.hpp>
 
 #ifndef CHECK_HIP_ERROR
@@ -57,42 +58,105 @@ void gemmex_wrapper_fp16(
     int64_t  max_workspace_size,
     hipStream_t   stream) 
 {
-    hipblaslt_ext::GemmPreference gemmPref;
-    gemmPref.setMaxWorkspaceBytes(max_workspace_size);
-    hipblaslt_ext::Gemm gemm(
-        handle, transa, transb, HIP_R_16BF, HIP_R_16BF, HIP_R_16BF, HIP_R_16BF, HIPBLAS_COMPUTE_32F);
+    hipblasLtMatrixLayout_t matA, matB, matC, matD;
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutCreate(&matA, HIP_R_16BF, m, k, m));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutCreate(&matB, HIP_R_16BF, n, k, n));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutCreate(&matC, HIP_R_16BF, m, n, m));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutCreate(&matD, HIP_R_16BF, m, n, m));
 
-    hipblaslt_ext::GemmEpilogue
-        epilogue; // No action needed, default is HIPBLASLT_EPILOGUE_DEFAULT. (Gemm only)
-    hipblaslt_ext::GemmInputs inputs;
-    inputs.a     = A;
-    inputs.b     = B;
-    inputs.c     = C;
-    inputs.d     = D;
-    inputs.alpha = &alpha;
-    inputs.beta  = &beta;
-    gemm.setProblem(m, n, k, batch_count, epilogue, inputs);
+    if(batch_count > 1)
+    {
+        int64_t stride_a = m * k;
+        int64_t stride_b = k * n;
+        int64_t stride_c = m * n;
+        int64_t stride_d = m * n;
+        CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutSetAttribute(
+            matA, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+        CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutSetAttribute(
+            matA, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_a, sizeof(stride_a)));
+        CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutSetAttribute(
+            matB, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+        CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutSetAttribute(
+            matB, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_b, sizeof(stride_b)));
+        CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutSetAttribute(
+            matC, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+        CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutSetAttribute(
+            matC, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_c, sizeof(stride_c)));
+        CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutSetAttribute(
+            matD, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+        CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutSetAttribute(
+            matD, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_d, sizeof(stride_d)));
+    }
 
-    const int                                     request_solutions = 1;
-    std::vector<hipblasLtMatmulHeuristicResult_t> heuristicResult;
-    CHECK_HIPBLASLT_ERROR(gemm.algoGetHeuristic(request_solutions, gemmPref, heuristicResult));
+    hipblasLtMatmulDesc_t matmul;
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescCreate(&matmul, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescSetAttribute(
+        matmul, HIPBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(int32_t)));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescSetAttribute(
+        matmul, HIPBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(int32_t)));
 
-    if(heuristicResult.empty())
+    hipblasLtEpilogue_t epilogue = HIPBLASLT_EPILOGUE_DEFAULT;
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescSetAttribute(
+        matmul, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+
+    // Set User Preference attributes
+    hipblasLtMatmulPreference_t pref;
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatmulPreferenceCreate(&pref));
+    CHECK_HIPBLASLT_ERROR(
+        hipblasLtMatmulPreferenceSetAttribute(pref,
+                                              HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                              &max_workspace_size,
+                                              sizeof(max_workspace_size)));
+
+    const int                        request_solutions = 1;
+    hipblasLtMatmulHeuristicResult_t heuristicResult[request_solutions];
+    int                              returnedAlgoCount = 0;
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatmulAlgoGetHeuristic(handle,
+                                                          matmul,
+                                                          matA,
+                                                          matB,
+                                                          matC,
+                                                          matD,
+                                                          pref,
+                                                          request_solutions,
+                                                          heuristicResult,
+                                                          &returnedAlgoCount));
+
+    if(returnedAlgoCount == 0)
     {
         std::cerr << "No valid solution found!" << std::endl;
         return;
     }
 
+    uint64_t workspace_size = 0;
+    for(int i = 0; i < returnedAlgoCount; i++)
+        workspace_size = max(workspace_size, heuristicResult[i].workspaceSize);
     // In this sample, the workspace is already allocated with max_workspace_size
-    // If not, calculate the needed workspace_size and allocate d_workspace here
-    // uint64_t workspace_size = 0;
-    // for(int i = 0; i < returnedAlgoCount; i++)
-    //     workspace_size = max(workspace_size, heuristicResult[i].workspaceSize);
+    // If not, allocate d_workspace here
     // CHECK_HIP_ERRORhipMalloc(&d_workspace, workspace_size));
 
-    // Make sure to initialize every time when algo changes
-    CHECK_HIPBLASLT_ERROR(gemm.initialize(heuristicResult[0].algo, d_workspace));
-    CHECK_HIPBLASLT_ERROR(gemm.run(stream));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatmul(handle,
+                                          matmul,
+                                          &alpha,
+                                          A,
+                                          matA,
+                                          B,
+                                          matB,
+                                          &beta,
+                                          C,
+                                          matC,
+                                          D,
+                                          matD,
+                                          &heuristicResult[0].algo,
+                                          d_workspace,
+                                          workspace_size,
+                                          stream));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutDestroy(matA));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutDestroy(matB));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutDestroy(matC));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutDestroy(matD));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescDestroy(matmul));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatmulPreferenceDestroy(pref));
     return;
 }
 
@@ -115,42 +179,105 @@ void gemmex_wrapper_fp16(
     int64_t  max_workspace_size,
     hipStream_t   stream) 
 {
-       hipblaslt_ext::GemmPreference gemmPref;
-    gemmPref.setMaxWorkspaceBytes(max_workspace_size);
-    hipblaslt_ext::Gemm gemm(
-        handle, transa, transb, HIP_R_16F, HIP_R_16F, HIP_R_16F, HIP_R_16F, HIPBLAS_COMPUTE_32F);
+    hipblasLtMatrixLayout_t matA, matB, matC, matD;
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutCreate(&matA, HIP_R_16F, m, k, m));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutCreate(&matB, HIP_R_16F, n, k, n));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutCreate(&matC, HIP_R_16F, m, n, m));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutCreate(&matD, HIP_R_16F, m, n, m));
 
-    hipblaslt_ext::GemmEpilogue
-        epilogue; // No action needed, default is HIPBLASLT_EPILOGUE_DEFAULT. (Gemm only)
-    hipblaslt_ext::GemmInputs inputs;
-    inputs.a     = A;
-    inputs.b     = B;
-    inputs.c     = C;
-    inputs.d     = D;
-    inputs.alpha = &alpha;
-    inputs.beta  = &beta;
-    gemm.setProblem(m, n, k, batch_count, epilogue, inputs);
+    if(batch_count > 1)
+    {
+        int64_t stride_a = m * k;
+        int64_t stride_b = k * n;
+        int64_t stride_c = m * n;
+        int64_t stride_d = m * n;
+        CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutSetAttribute(
+            matA, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+        CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutSetAttribute(
+            matA, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_a, sizeof(stride_a)));
+        CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutSetAttribute(
+            matB, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+        CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutSetAttribute(
+            matB, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_b, sizeof(stride_b)));
+        CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutSetAttribute(
+            matC, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+        CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutSetAttribute(
+            matC, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_c, sizeof(stride_c)));
+        CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutSetAttribute(
+            matD, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+        CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutSetAttribute(
+            matD, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_d, sizeof(stride_d)));
+    }
 
-    const int                                     request_solutions = 1;
-    std::vector<hipblasLtMatmulHeuristicResult_t> heuristicResult;
-    CHECK_HIPBLASLT_ERROR(gemm.algoGetHeuristic(request_solutions, gemmPref, heuristicResult));
+    hipblasLtMatmulDesc_t matmul;
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescCreate(&matmul, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescSetAttribute(
+        matmul, HIPBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(int32_t)));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescSetAttribute(
+        matmul, HIPBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(int32_t)));
 
-    if(heuristicResult.empty())
+    hipblasLtEpilogue_t epilogue = HIPBLASLT_EPILOGUE_DEFAULT;
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescSetAttribute(
+        matmul, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+
+    // Set User Preference attributes
+    hipblasLtMatmulPreference_t pref;
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatmulPreferenceCreate(&pref));
+    CHECK_HIPBLASLT_ERROR(
+        hipblasLtMatmulPreferenceSetAttribute(pref,
+                                              HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                              &max_workspace_size,
+                                              sizeof(max_workspace_size)));
+
+    const int                        request_solutions = 1;
+    hipblasLtMatmulHeuristicResult_t heuristicResult[request_solutions];
+    int                              returnedAlgoCount = 0;
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatmulAlgoGetHeuristic(handle,
+                                                          matmul,
+                                                          matA,
+                                                          matB,
+                                                          matC,
+                                                          matD,
+                                                          pref,
+                                                          request_solutions,
+                                                          heuristicResult,
+                                                          &returnedAlgoCount));
+
+    if(returnedAlgoCount == 0)
     {
         std::cerr << "No valid solution found!" << std::endl;
         return;
     }
 
+    uint64_t workspace_size = 0;
+    for(int i = 0; i < returnedAlgoCount; i++)
+        workspace_size = max(workspace_size, heuristicResult[i].workspaceSize);
     // In this sample, the workspace is already allocated with max_workspace_size
-    // If not, calculate the needed workspace_size and allocate d_workspace here
-    // uint64_t workspace_size = 0;
-    // for(int i = 0; i < returnedAlgoCount; i++)
-    //     workspace_size = max(workspace_size, heuristicResult[i].workspaceSize);
+    // If not, allocate d_workspace here
     // CHECK_HIP_ERRORhipMalloc(&d_workspace, workspace_size));
 
-    // Make sure to initialize every time when algo changes
-    CHECK_HIPBLASLT_ERROR(gemm.initialize(heuristicResult[0].algo, d_workspace));
-    CHECK_HIPBLASLT_ERROR(gemm.run(stream));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatmul(handle,
+                                          matmul,
+                                          &alpha,
+                                          A,
+                                          matA,
+                                          B,
+                                          matB,
+                                          &beta,
+                                          C,
+                                          matC,
+                                          D,
+                                          matD,
+                                          &heuristicResult[0].algo,
+                                          d_workspace,
+                                          workspace_size,
+                                          stream));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutDestroy(matA));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutDestroy(matB));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutDestroy(matC));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutDestroy(matD));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescDestroy(matmul));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatmulPreferenceDestroy(pref));
     return;
 }
 
@@ -159,12 +286,14 @@ void gemmex_wrapper_fp16(
 
 template <typename T>
 void wgrad_gemm_accum_fp16_cuda(T *input, T *d_output,  T *dc_tensor, T *d_weight,int in_dim, int hidden_dim, int out_dim) {
-    //cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
-    //if(g_hipblas_handle == nullptr)
-    //   CHECK_HIPBLAS_ERROR(hipblasCreate(&g_hipblas_handle));
-    hipblasLtHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    //hipblasLtHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    //hipStream_t stream;
+    //hipblasGetStream(handle, &stream);
+    hipblasLtHandle_t handle;
     hipStream_t stream;
-    hipblasGetStream(handle, &stream);
+    CHECK_HIP_ERROR(hipStreamCreate(&stream));
+    CHECK_HIPBLASLT_ERROR(hipblasLtCreate(&handle));
+
     float alpha = 1.0;
     float beta  = 1.0;
     const int batch_count = 1;
@@ -189,6 +318,9 @@ void wgrad_gemm_accum_fp16_cuda(T *input, T *d_output,  T *dc_tensor, T *d_weigh
         d_workspace,
         max_workspace_size,
         stream);
+
+    CHECK_HIPBLASLT_ERROR(hipblasLtDestroy(handle));
+    CHECK_HIP_ERROR(hipStreamDestroy(stream));
 } 
 
 template void wgrad_gemm_accum_fp16_cuda<at::Half>(at::Half *input, at::Half *d_output,  at::Half *dc_tensor, at::Half *d_weight, int in_dim, int hidden_dim, int out_dim);
